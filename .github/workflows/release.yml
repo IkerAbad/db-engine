@@ -42,7 +42,7 @@ jobs:
           tar -czf "db-engine-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" -C stage .
           ls -l "db-engine-${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: db-engine-linux
           path: db-engine-*.tar.gz
@@ -83,7 +83,7 @@ jobs:
           Compress-Archive -Path stage\* -DestinationPath "db-engine-$env:GITHUB_REF_NAME-windows-x86_64.zip"
           Get-ChildItem "db-engine-*.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: db-engine-windows
           path: db-engine-*.zip
@@ -97,7 +97,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -115,3 +115,4 @@ jobs:
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
             gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
           gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+
