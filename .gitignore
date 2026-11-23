@@ -1,0 +1,16 @@
+build/
+build*/
+out/
+dbdata/
+smoke-db/
+*.exe
+*.obj
+*.o
+*.pdb
+.vs/
+.vscode/
+__pycache__/
+*.pyc
+data/
+bench-data/
+CMakeUserPresets.json
