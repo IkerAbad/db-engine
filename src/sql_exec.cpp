@@ -6,9 +6,11 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -203,6 +205,156 @@ public:
 private:
     std::unique_ptr<RowIterator> child_;
     std::uint64_t remaining_;
+};
+
+struct JoinKey {
+    ColumnType type = ColumnType::Int;
+    std::int64_t integer = 0;
+    std::uint64_t bits = 0;
+    bool boolean = false;
+    std::string text;
+
+    static JoinKey from(const Value& value) {
+        JoinKey key;
+        key.type = value.type;
+        switch (value.type) {
+            case ColumnType::Int:
+                key.integer = value.integer;
+                break;
+            case ColumnType::Double:
+                key.bits = double_to_bits(value.real);
+                break;
+            case ColumnType::Bool:
+                key.boolean = value.boolean;
+                break;
+            case ColumnType::Text:
+                key.text = value.text;
+                break;
+        }
+        return key;
+    }
+
+    bool operator==(const JoinKey& other) const {
+        if (type != other.type) {
+            return false;
+        }
+        switch (type) {
+            case ColumnType::Int:
+                return integer == other.integer;
+            case ColumnType::Double:
+                return bits == other.bits;
+            case ColumnType::Bool:
+                return boolean == other.boolean;
+            case ColumnType::Text:
+                return text == other.text;
+        }
+        return false;
+    }
+};
+
+struct JoinKeyHash {
+    std::size_t operator()(const JoinKey& key) const {
+        std::size_t hash = std::hash<int>{}(static_cast<int>(key.type));
+        switch (key.type) {
+            case ColumnType::Int:
+                return mix(hash, std::hash<std::int64_t>{}(key.integer));
+            case ColumnType::Double:
+                return mix(hash, std::hash<std::uint64_t>{}(key.bits));
+            case ColumnType::Bool:
+                return mix(hash, std::hash<bool>{}(key.boolean));
+            case ColumnType::Text:
+                return mix(hash, std::hash<std::string>{}(key.text));
+        }
+        return hash;
+    }
+
+private:
+    static std::size_t mix(std::size_t hash, std::size_t value) {
+        return hash ^ (value + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
+    }
+};
+
+class HashJoinIterator : public RowIterator {
+public:
+    HashJoinIterator(std::unique_ptr<RowIterator> probe,
+                     std::unique_ptr<RowIterator> build,
+                     const Schema& build_schema, int probe_key, int build_key,
+                     std::size_t memory_limit)
+        : probe_(std::move(probe)),
+          build_(std::move(build)),
+          build_schema_(build_schema),
+          probe_key_(probe_key),
+          build_key_(build_key),
+          limit_(memory_limit) {}
+
+    bool next(std::vector<Value>& row) override {
+        if (!built_) {
+            build_table();
+        }
+        if (build_table_.empty()) {
+            return false;
+        }
+        while (true) {
+            if (matches_ != nullptr && match_index_ < matches_->size()) {
+                row = probe_row_;
+                const auto right =
+                    build_schema_.decode((*matches_)[match_index_++]);
+                row.insert(row.end(), right.begin(), right.end());
+                return true;
+            }
+            matches_ = nullptr;
+            match_index_ = 0;
+            if (!probe_->next(probe_row_)) {
+                return false;
+            }
+            const JoinKey key =
+                JoinKey::from(probe_row_[static_cast<std::size_t>(probe_key_)]);
+            const auto found = build_table_.find(key);
+            if (found == build_table_.end()) {
+                continue;
+            }
+            matches_ = &found->second;
+        }
+    }
+
+private:
+    void build_table() {
+        built_ = true;
+        std::vector<Value> row;
+        while (build_->next(row)) {
+            const JoinKey key =
+                JoinKey::from(row[static_cast<std::size_t>(build_key_)]);
+            std::size_t cost =
+                static_cast<std::size_t>(build_schema_.row_size) + 128;
+            if (key.type == ColumnType::Text) {
+                cost += key.text.size();
+            }
+            if (memory_ + cost > limit_) {
+                fail("hash join build side exceeds the " +
+                     std::to_string(limit_) +
+                     "-byte memory limit; increase join_buffer_bytes or use a "
+                     "smaller build table");
+            }
+            memory_ += cost;
+            build_table_[key].push_back(build_schema_.encode(row));
+        }
+        build_.reset();
+    }
+
+    std::unique_ptr<RowIterator> probe_;
+    std::unique_ptr<RowIterator> build_;
+    const Schema& build_schema_;
+    int probe_key_ = 0;
+    int build_key_ = 0;
+    std::size_t limit_ = 0;
+    std::size_t memory_ = 0;
+    bool built_ = false;
+    std::unordered_map<JoinKey, std::vector<std::vector<std::uint8_t>>,
+                       JoinKeyHash>
+        build_table_;
+    std::vector<Value> probe_row_;
+    const std::vector<std::vector<std::uint8_t>>* matches_ = nullptr;
+    std::size_t match_index_ = 0;
 };
 
 class SortIterator : public RowIterator {
@@ -421,6 +573,49 @@ std::unique_ptr<RowIterator> make_scan(BTree& tree, const Schema& schema,
     return std::make_unique<IndexScanIterator>(tree, schema, reverse, lo, hi, empty);
 }
 
+struct JoinSide {
+    int side = 0;
+    int index = 0;
+};
+
+JoinSide resolve_join_column(const TableDef& left, const TableDef& right,
+                             const ColumnRef& reference, const char* clause) {
+    const std::string qualifier = ascii_lower(reference.table);
+    const std::string name = ascii_lower(reference.column);
+    if (!qualifier.empty()) {
+        if (qualifier == left.name) {
+            const int index = left.schema.column_index(name);
+            if (index < 0) {
+                fail("no such column: " + reference.table + "." +
+                     reference.column);
+            }
+            return {0, index};
+        }
+        if (qualifier == right.name) {
+            const int index = right.schema.column_index(name);
+            if (index < 0) {
+                fail("no such column: " + reference.table + "." +
+                     reference.column);
+            }
+            return {1, index};
+        }
+        fail("unknown table " + reference.table + " in " + clause);
+    }
+    const int left_index = left.schema.column_index(name);
+    const int right_index = right.schema.column_index(name);
+    if (left_index >= 0 && right_index >= 0) {
+        fail("ambiguous column " + reference.column + " in " + clause +
+             "; qualify it as table.column");
+    }
+    if (left_index >= 0) {
+        return {0, left_index};
+    }
+    if (right_index >= 0) {
+        return {1, right_index};
+    }
+    fail("no such column: " + reference.column);
+}
+
 }  // namespace
 
 std::vector<QueryResult> Engine::execute(std::string_view sql,
@@ -454,7 +649,9 @@ QueryResult Engine::execute_statement(const Statement& statement,
         case StatementKind::Insert:
             return insert_rows(statement, sink);
         case StatementKind::Select:
-            return select_rows(statement, sink);
+            return statement.join.has_value()
+                       ? select_join_rows(statement, sink)
+                       : select_rows(statement, sink);
         case StatementKind::Delete:
             return delete_rows(statement);
         case StatementKind::Begin: {
@@ -707,17 +904,30 @@ QueryResult Engine::select_rows(const Statement& statement, const RowSink& sink)
                 }
                 break;
             }
+            if (!item.table.empty()) {
+                const std::string qualifier = ascii_lower(item.table);
+                if (qualifier != table.name) {
+                    fail("unknown table " + item.table + " in SELECT");
+                }
+            }
             const int index = schema.column_index(item.column);
             if (index < 0) {
                 fail("no such column: " + item.column);
             }
             projection.push_back(index);
-            names.push_back(schema.columns[static_cast<std::size_t>(index)].name);
+            names.push_back(item.table.empty()
+                                ? schema.columns[static_cast<std::size_t>(index)].name
+                                : table.name + "." +
+                                      schema.columns[static_cast<std::size_t>(index)].name);
         }
     }
 
     std::vector<FilterPredicate> filters;
     for (const Comparison& comparison : statement.where) {
+        if (!comparison.table.empty() &&
+            ascii_lower(comparison.table) != table.name) {
+            fail("unknown table " + comparison.table + " in WHERE");
+        }
         const int index = schema.column_index(comparison.column);
         if (index < 0) {
             fail("no such column: " + comparison.column);
@@ -736,6 +946,10 @@ QueryResult Engine::select_rows(const Statement& statement, const RowSink& sink)
     int order_column = -1;
     bool descending = false;
     if (statement.order_by.has_value()) {
+        if (!statement.order_by->table.empty() &&
+            ascii_lower(statement.order_by->table) != table.name) {
+            fail("unknown table " + statement.order_by->table + " in ORDER BY");
+        }
         order_column = schema.column_index(statement.order_by->column);
         if (order_column < 0) {
             fail("no such column: " + statement.order_by->column);
@@ -813,12 +1027,197 @@ QueryResult Engine::select_rows(const Statement& statement, const RowSink& sink)
     return result;
 }
 
+QueryResult Engine::select_join_rows(const Statement& statement,
+                                     const RowSink& sink) {
+    TableDef& left = require_table(statement.table);
+    TableDef& right = require_table(statement.join->table);
+    const Schema& left_schema = left.schema;
+    const Schema& right_schema = right.schema;
+    const std::size_t left_count = left_schema.columns.size();
+
+    const JoinSide on_left =
+        resolve_join_column(left, right, statement.join->left, "JOIN ON");
+    const JoinSide on_right =
+        resolve_join_column(left, right, statement.join->right, "JOIN ON");
+    if (on_left.side == on_right.side) {
+        fail("JOIN ON must compare a column from each table");
+    }
+    const int left_key = on_left.side == 0 ? on_left.index : on_right.index;
+    const int right_key = on_left.side == 1 ? on_left.index : on_right.index;
+    if (left_schema.columns[static_cast<std::size_t>(left_key)].type !=
+        right_schema.columns[static_cast<std::size_t>(right_key)].type) {
+        fail("JOIN columns must have the same type");
+    }
+
+    Schema combined;
+    combined.columns = left_schema.columns;
+    combined.columns.insert(combined.columns.end(), right_schema.columns.begin(),
+                            right_schema.columns.end());
+    combined.offsets = left_schema.offsets;
+    for (const std::uint16_t offset : right_schema.offsets) {
+        combined.offsets.push_back(
+            static_cast<std::uint16_t>(left_schema.row_size + offset));
+    }
+    combined.row_size = static_cast<std::uint16_t>(
+        left_schema.row_size + right_schema.row_size);
+    combined.pk_index = -1;
+
+    const bool count = std::any_of(
+        statement.select_items.begin(), statement.select_items.end(),
+        [](const SelectItem& item) { return item.count_star; });
+    if (count && statement.select_items.size() != 1) {
+        fail("COUNT(*) cannot be combined with other select items");
+    }
+
+    std::vector<int> projection;
+    std::vector<std::string> names;
+    if (!count) {
+        for (const SelectItem& item : statement.select_items) {
+            if (item.star) {
+                if (statement.select_items.size() != 1) {
+                    fail("'*' cannot be combined with other select items");
+                }
+                projection.clear();
+                names.clear();
+                for (std::size_t i = 0; i < left_count; ++i) {
+                    projection.push_back(static_cast<int>(i));
+                    names.push_back(left.name + "." +
+                                    left_schema.columns[i].name);
+                }
+                for (std::size_t i = 0; i < right_schema.columns.size(); ++i) {
+                    projection.push_back(static_cast<int>(left_count + i));
+                    names.push_back(right.name + "." +
+                                    right_schema.columns[i].name);
+                }
+                break;
+            }
+            const JoinSide side = resolve_join_column(
+                left, right, ColumnRef{item.table, item.column}, "SELECT");
+            projection.push_back(
+                side.side == 0 ? side.index
+                               : static_cast<int>(left_count) + side.index);
+            names.push_back(item.table.empty()
+                                ? item.column
+                                : item.table + "." + item.column);
+        }
+    }
+
+    std::vector<FilterPredicate> filters;
+    for (const Comparison& comparison : statement.where) {
+        const JoinSide side = resolve_join_column(
+            left, right, ColumnRef{comparison.table, comparison.column},
+            "WHERE");
+        const Column& column =
+            side.side == 0
+                ? left_schema.columns[static_cast<std::size_t>(side.index)]
+                : right_schema.columns[static_cast<std::size_t>(side.index)];
+        const int combined_index =
+            side.side == 0 ? side.index
+                           : static_cast<int>(left_count) + side.index;
+        filters.push_back(
+            {combined_index, comparison.op,
+             coerce_value(comparison.value, column, comparison.column, false)});
+    }
+
+    int order_column = -1;
+    bool descending = false;
+    if (statement.order_by.has_value()) {
+        const JoinSide side = resolve_join_column(
+            left, right,
+            ColumnRef{statement.order_by->table, statement.order_by->column},
+            "ORDER BY");
+        order_column = side.side == 0
+                           ? side.index
+                           : static_cast<int>(left_count) + side.index;
+        descending = statement.order_by->descending;
+    }
+
+    BTree left_tree(*pool_, left.meta_page);
+    BTree right_tree(*pool_, right.meta_page);
+    const ScanBound no_bound;
+    std::unique_ptr<RowIterator> left_scan =
+        make_scan(left_tree, left_schema, false, no_bound, no_bound, false);
+    std::unique_ptr<RowIterator> right_scan =
+        make_scan(right_tree, right_schema, false, no_bound, no_bound, false);
+    std::unique_ptr<RowIterator> current =
+        std::make_unique<HashJoinIterator>(
+            std::move(left_scan), std::move(right_scan), right_schema,
+            left_key, right_key, options_.join_buffer_bytes);
+    if (!filters.empty()) {
+        current = std::make_unique<FilterIterator>(std::move(current),
+                                                   std::move(filters));
+    }
+    if (order_column >= 0 && !count) {
+        current = std::make_unique<SortIterator>(
+            std::move(current), combined, order_column, descending,
+            options_.sort_buffer_bytes, options_.directory / "tmp");
+    }
+
+    QueryResult result;
+    if (count) {
+        std::uint64_t total = 0;
+        std::vector<Value> row;
+        while (current->next(row)) {
+            ++total;
+        }
+        result.columns = {"count"};
+        if (!statement.limit.has_value() || *statement.limit > 0) {
+            if (sink) {
+                sink({Value::make_int(static_cast<std::int64_t>(total))});
+            }
+            result.rows = 1;
+            result.message = "1 row";
+        } else {
+            result.message = "0 rows";
+        }
+        return result;
+    }
+
+    if (statement.limit.has_value()) {
+        current = std::make_unique<LimitIterator>(std::move(current),
+                                                  *statement.limit);
+    }
+
+    result.columns = names;
+    bool all_columns = projection.size() == combined.columns.size();
+    for (std::size_t i = 0; i < projection.size() && all_columns; ++i) {
+        if (projection[i] != static_cast<int>(i)) {
+            all_columns = false;
+        }
+    }
+    std::vector<Value> row;
+    while (current->next(row)) {
+        if (all_columns) {
+            if (sink) {
+                sink(row);
+            }
+        } else {
+            std::vector<Value> selected;
+            selected.reserve(projection.size());
+            for (const int index : projection) {
+                selected.push_back(row[static_cast<std::size_t>(index)]);
+            }
+            if (sink) {
+                sink(selected);
+            }
+        }
+        ++result.rows;
+    }
+    result.message = std::to_string(result.rows) +
+                     (result.rows == 1 ? " row" : " rows");
+    return result;
+}
+
 QueryResult Engine::delete_rows(const Statement& statement) {
     TableDef& table = require_table(statement.table);
     const Schema& schema = table.schema;
 
     std::vector<FilterPredicate> filters;
     for (const Comparison& comparison : statement.where) {
+        if (!comparison.table.empty() &&
+            ascii_lower(comparison.table) != table.name) {
+            fail("unknown table " + comparison.table + " in WHERE");
+        }
         const int index = schema.column_index(comparison.column);
         if (index < 0) {
             fail("no such column: " + comparison.column);

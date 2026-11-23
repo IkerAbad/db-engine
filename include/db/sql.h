@@ -28,21 +28,35 @@ struct CreateColumn {
     bool primary_key = false;
 };
 
+struct ColumnRef {
+    std::string table;
+    std::string column;
+};
+
 struct SelectItem {
     bool star = false;
     bool count_star = false;
+    std::string table;
     std::string column;
 };
 
 struct Comparison {
+    std::string table;
     std::string column;
     std::string op;
     Value value;
 };
 
 struct OrderBy {
+    std::string table;
     std::string column;
     bool descending = false;
+};
+
+struct JoinClause {
+    std::string table;
+    ColumnRef left;
+    ColumnRef right;
 };
 
 struct Statement {
@@ -56,6 +70,7 @@ struct Statement {
     std::vector<SelectItem> select_items;
     std::vector<Comparison> where;
     std::optional<OrderBy> order_by;
+    std::optional<JoinClause> join;
     std::optional<std::uint64_t> limit;
 };
 

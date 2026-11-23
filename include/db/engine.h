@@ -19,6 +19,7 @@ struct EngineOptions {
     std::filesystem::path directory;
     std::size_t buffer_pages = 4096;
     std::size_t sort_buffer_bytes = 4 * 1024 * 1024;
+    std::size_t join_buffer_bytes = 64 * 1024 * 1024;
 };
 
 struct QueryResult {
@@ -57,6 +58,7 @@ private:
     QueryResult drop_table(const Statement& statement);
     QueryResult insert_rows(const Statement& statement, const RowSink& sink);
     QueryResult select_rows(const Statement& statement, const RowSink& sink);
+    QueryResult select_join_rows(const Statement& statement, const RowSink& sink);
     QueryResult delete_rows(const Statement& statement);
 
     TableDef& require_table(std::string_view name);

@@ -202,6 +202,16 @@ private:
         return name;
     }
 
+    ColumnRef parse_column_ref() {
+        ColumnRef reference;
+        reference.column = expect_identifier();
+        if (match_symbol(".")) {
+            reference.table = reference.column;
+            reference.column = expect_identifier();
+        }
+        return reference;
+    }
+
     bool match_symbol(std::string_view symbol) {
         if (current().kind == TokenKind::Symbol && current().text == symbol) {
             ++pos_;
@@ -354,7 +364,9 @@ private:
                 expect_symbol(")");
                 item.count_star = true;
             } else {
-                item.column = expect_identifier();
+                const ColumnRef reference = parse_column_ref();
+                item.table = reference.table;
+                item.column = reference.column;
             }
             statement.select_items.push_back(std::move(item));
             if (!match_symbol(",")) {
@@ -363,13 +375,21 @@ private:
         }
         expect_word("from");
         statement.table = expect_identifier();
+        if (match_word("inner")) {
+            expect_word("join");
+            parse_join(statement);
+        } else if (match_word("join")) {
+            parse_join(statement);
+        }
         if (match_word("where")) {
             parse_where(statement);
         }
         if (match_word("order")) {
             expect_word("by");
             OrderBy order;
-            order.column = expect_identifier();
+            const ColumnRef reference = parse_column_ref();
+            order.table = reference.table;
+            order.column = reference.column;
             if (match_word("desc")) {
                 order.descending = true;
             } else {
@@ -381,6 +401,16 @@ private:
             statement.limit = parse_unsigned();
         }
         return statement;
+    }
+
+    void parse_join(Statement& statement) {
+        JoinClause join;
+        join.table = expect_identifier();
+        expect_word("on");
+        join.left = parse_column_ref();
+        expect_symbol("=");
+        join.right = parse_column_ref();
+        statement.join = std::move(join);
     }
 
     Statement parse_delete() {
@@ -404,10 +434,14 @@ private:
                 const Value value = parse_literal();
                 comparison.value = value;
                 comparison.op = parse_operator();
-                comparison.column = expect_identifier();
+                const ColumnRef reference = parse_column_ref();
+                comparison.table = reference.table;
+                comparison.column = reference.column;
                 comparison.op = reverse_operator(comparison.op);
             } else {
-                comparison.column = expect_identifier();
+                const ColumnRef reference = parse_column_ref();
+                comparison.table = reference.table;
+                comparison.column = reference.column;
                 comparison.op = parse_operator();
                 comparison.value = parse_literal();
             }

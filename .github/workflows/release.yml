@@ -29,7 +29,9 @@ jobs:
           cat > smoke.sql <<'SQL'
           CREATE TABLE t (id INT PRIMARY KEY, v INT);
           INSERT INTO t VALUES (1, 10), (2, 20);
-          SELECT COUNT(*) FROM t;
+          CREATE TABLE u (id INT PRIMARY KEY, t_id INT);
+          INSERT INTO u VALUES (100, 1), (101, 1), (102, 2);
+          SELECT t.id, u.id FROM t JOIN u ON t.id = u.t_id ORDER BY u.id;
           SQL
           ./build/db_engine --version
           ./build/db_engine --db smoke-db --script smoke.sql
@@ -69,7 +71,9 @@ jobs:
           @'
           CREATE TABLE t (id INT PRIMARY KEY, v INT);
           INSERT INTO t VALUES (1, 10), (2, 20);
-          SELECT COUNT(*) FROM t;
+          CREATE TABLE u (id INT PRIMARY KEY, t_id INT);
+          INSERT INTO u VALUES (100, 1), (101, 1), (102, 2);
+          SELECT t.id, u.id FROM t JOIN u ON t.id = u.t_id ORDER BY u.id;
           '@ | Set-Content -Encoding utf8 smoke.sql
           .\build\Release\db_engine.exe --version
           .\build\Release\db_engine.exe --db smoke-db --script smoke.sql

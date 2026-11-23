@@ -3,6 +3,7 @@
 [![ci](https://github.com/IkerAbad/db-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/IkerAbad/db-engine/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT-333?style=flat-square)](LICENSE)
 ![c++23](https://img.shields.io/badge/C%2B%2B-23-333?style=flat-square)
+![version](https://img.shields.io/badge/version-0.2.0-333?style=flat-square)
 
 A relational storage engine and SQL executor in C++23. It uses 4 KB pages, an
 LRU buffer pool, a B+tree, a write-ahead log and crash recovery. There are no
@@ -26,8 +27,10 @@ not to compete with SQLite.
 - Checkpoints and automatic recovery at startup.
 - SQL parser and a volcano-model executor: table and index scans, filter,
   projection, sort (spills to disk) and limit iterators.
+- Inner hash join of two tables on one equality, with qualified column
+  resolution and a bounded build side.
 - Interactive shell and script mode.
-- 25 unit tests, 44 crash-recovery scenarios and a 100k insert benchmark.
+- 32 unit tests, 44 crash-recovery scenarios and a 100k insert benchmark.
 
 ## Quick start
 
@@ -72,6 +75,14 @@ ORDER BY id DESC
 LIMIT 5;
 
 SELECT COUNT(*) FROM name WHERE active = true;
+
+SELECT users.id, orders.total
+FROM users
+INNER JOIN orders ON users.id = orders.user_id
+WHERE orders.total > 10
+ORDER BY users.id
+LIMIT 5;
+
 DELETE FROM name WHERE id = 3;
 
 BEGIN;
@@ -85,11 +96,19 @@ Supported predicates are comparisons on a single column joined by `AND`:
 aggregate. The primary key must be `INT`, every `INSERT` must provide every
 column, and `NULL` is not supported.
 
+The join form is an inner equijoin of two tables. Qualified names are
+`table.column`. An unqualified name is accepted only when it exists in exactly
+one of the two tables; otherwise the engine reports an ambiguous column.
+`SELECT *` returns the left table columns followed by the right table columns,
+labelled `table.column`. The right table is the build side and the engine does
+not reorder the join. Table aliases are not supported, so a table cannot be
+joined to itself.
+
 `WHERE` predicates on the primary key become B+tree range bounds. Other
 predicates are evaluated by a filter iterator. `ORDER BY` on the primary key
 uses the index order and needs no sort. Sorting any other column uses an
 external merge sort with a fixed buffer, so memory stays bounded even when the
-result is large.
+result is large. A join uses full table scans, not B+tree range bounds.
 
 ## Building and testing
 
@@ -153,6 +172,25 @@ separators left.
 The meta page stores the first leaf as well as the root. The leaf chain is
 therefore reachable even if the internal levels were written in a different
 order. Recovery uses the chain as the source of truth, as described below.
+
+### Hash join
+
+`SELECT ... FROM left [INNER] JOIN right ON left.col = right.col` runs as a
+single-threaded in-memory hash join:
+
+1. Scan the right table, compute the join key from the `ON` column and append the
+   encoded right row to a hash bucket.
+2. Scan the left table and probe the bucket for every left row.
+3. Emit the left row followed by each matching right row. The result is passed
+   to the normal filter, sort, limit and projection iterators.
+4. If the build side exceeds `join_buffer_bytes` (64 MiB by default,
+   `--join-buffer` on the command line), the query fails with an explicit
+   error. There is no hash join spilling.
+
+The right table is always the build side and the plan is not reordered. Both
+tables are read with full scans, because the engine has no secondary indexes.
+The single-table path still uses B+tree range bounds. `WHERE` runs after the
+join and `ORDER BY` uses the external merge sort described above.
 
 ### Transactions and WAL
 
@@ -255,9 +293,11 @@ cost of an individual committed statement. The range scan measures a plan that
 seeks into the B+tree and returns 100 rows.
 
 Memory is bounded by construction: a 4096-frame buffer pool (16 MiB), a 4 MiB
-sort buffer and one row per iterator. The 25 MiB peak is the pool plus the
-process itself. With `--buffer-pages 256` the 10,000-row run peaks at 7.73 MiB,
-at the cost of more page writes and a lower insert throughput.
+sort buffer and one row per iterator. A join query can additionally hold up to
+`join_buffer_bytes` (64 MiB) for its build side, and that is where it fails if
+the right table does not fit. The 25 MiB peak is the single-table benchmark
+above. With `--buffer-pages 256` the 10,000-row run peaks at 7.73 MiB, at the
+cost of more page writes and a lower insert throughput.
 
 ## Why not SQLite
 
@@ -273,16 +313,18 @@ It does not compete with SQLite, and it is not a replacement for any production
 database. SQLite has decades of hardening, a query planner, secondary indexes,
 joins, concurrent readers, a huge compatibility and test surface, and an
 ecosystem around it. This engine is single-threaded, has one active transaction,
-no joins or secondary indexes, never reuses pages, and rebuilds its B+tree
-during recovery. Its purpose is to show that the mechanisms can be built and
-verified from scratch, not to store anyone's real data.
+only two-table inner joins, no secondary indexes, never reuses pages, and
+rebuilds its B+tree during recovery. Its purpose is to show that the mechanisms
+can be built and verified from scratch, not to store anyone's real data.
 
 ## What is deliberately missing
 
 - One thread, one active transaction and one process at a time. No MVCC,
   locking or isolation levels.
-- No joins, secondary indexes, `UPDATE`, `GROUP BY`, `OR`, subqueries or
-  `ALTER TABLE`.
+- Only inner equijoins of two tables. No outer joins, multi-table joins, join
+  reordering, hash join spilling or table aliases. The right table is always the
+  build side.
+- No secondary indexes, `UPDATE`, `GROUP BY`, `OR`, subqueries or `ALTER TABLE`.
 - No `NULL`, no defaults. Every `INSERT` must supply every column.
 - DDL is autocommit and cannot run inside an explicit transaction.
 - Page ids are never reused. Merged or dropped pages stay allocated until the

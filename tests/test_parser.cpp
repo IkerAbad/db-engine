@@ -69,6 +69,34 @@ TEST(parser_transactions) {
     CHECK(statements[3].kind == StatementKind::Rollback);
 }
 
+TEST(parser_join) {
+    const auto statements = parse_sql(
+        "SELECT a.id, b.v FROM a INNER JOIN b ON a.id = b.id "
+        "WHERE b.v > 3 ORDER BY b.v DESC LIMIT 2;");
+    CHECK_EQ(statements.size(), 1u);
+    const Statement& statement = statements[0];
+    CHECK(statement.join.has_value());
+    CHECK_EQ(statement.join->table, "b");
+    CHECK_EQ(statement.join->left.table, "a");
+    CHECK_EQ(statement.join->left.column, "id");
+    CHECK_EQ(statement.join->right.table, "b");
+    CHECK_EQ(statement.join->right.column, "id");
+    CHECK_EQ(statement.select_items[0].table, "a");
+    CHECK_EQ(statement.select_items[0].column, "id");
+    CHECK_EQ(statement.select_items[1].table, "b");
+    CHECK_EQ(statement.select_items[1].column, "v");
+    CHECK_EQ(statement.where[0].table, "b");
+    CHECK_EQ(statement.where[0].column, "v");
+    CHECK_EQ(statement.order_by->table, "b");
+    CHECK_EQ(statement.order_by->column, "v");
+    CHECK_EQ(*statement.limit, 2u);
+
+    const auto plain = parse_sql("SELECT * FROM a JOIN b ON a.id = b.id;");
+    CHECK(plain[0].join.has_value());
+    CHECK_THROWS(parse_sql("SELECT * FROM a JOIN b"));
+    CHECK_THROWS(parse_sql("SELECT * FROM a JOIN b ON a.id != b.id"));
+}
+
 TEST(parser_errors) {
     CHECK_THROWS(parse_sql("SELECT FROM t"));
     CHECK_THROWS(parse_sql("CREATE TABLE t (id INT PRIMARY KEY"));

@@ -2,6 +2,8 @@
 #include "temp_dir.h"
 #include "test.h"
 
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -21,6 +23,15 @@ std::vector<std::vector<Value>> collect(Engine& engine, const std::string& sql) 
     std::vector<std::vector<Value>> rows;
     engine.execute(sql, [&](const std::vector<Value>& row) { rows.push_back(row); });
     return rows;
+}
+
+std::vector<std::string> column_names(Engine& engine, const std::string& sql) {
+    const auto results =
+        engine.execute(sql, [](const std::vector<Value>&) {});
+    if (results.empty()) {
+        return {};
+    }
+    return results[0].columns;
 }
 
 std::int64_t count(Engine& engine, const std::string& table) {
@@ -57,6 +68,12 @@ TEST(engine_crud_and_persistence) {
         CHECK_EQ(rows[0][0].as_int(), 2);
         CHECK_EQ(rows[0][1].text, "bob");
         CHECK_EQ(rows[1][0].as_int(), 3);
+
+        const auto qualified = collect(
+            engine, "SELECT users.id FROM users WHERE users.id = 1");
+        CHECK_EQ(qualified.size(), 1u);
+        CHECK_EQ(qualified[0][0].as_int(), 1);
+        CHECK_THROWS(engine.execute("SELECT other.id FROM users", nullptr));
 
         require_check(engine);
         engine.close();
@@ -202,5 +219,197 @@ TEST(engine_delete_everything) {
     require_check(engine);
     engine.execute("INSERT INTO t VALUES (1, 1)", nullptr);
     CHECK_EQ(count(engine, "t"), 1);
+    require_check(engine);
+}
+
+TEST(engine_join_empty) {
+    test::TempDir dir("engine-join-empty");
+    Engine engine(options_for(dir));
+    engine.open();
+    engine.execute("CREATE TABLE l (id INT PRIMARY KEY, v INT)", nullptr);
+    engine.execute("CREATE TABLE r (id INT PRIMARY KEY, v INT)", nullptr);
+    engine.execute("INSERT INTO r VALUES (1, 10), (2, 20)", nullptr);
+
+    auto rows = collect(engine, "SELECT l.id, r.v FROM l JOIN r ON l.id = r.id");
+    CHECK(rows.empty());
+    auto counted =
+        collect(engine, "SELECT COUNT(*) FROM l JOIN r ON l.id = r.id");
+    CHECK_EQ(counted.size(), 1u);
+    CHECK_EQ(counted[0][0].as_int(), 0);
+
+    engine.execute("INSERT INTO l VALUES (1, 100)", nullptr);
+    engine.execute("DELETE FROM r", nullptr);
+    rows = collect(engine, "SELECT l.id, r.v FROM l JOIN r ON l.id = r.id");
+    CHECK(rows.empty());
+    require_check(engine);
+}
+
+TEST(engine_join_duplicates) {
+    test::TempDir dir("engine-join-duplicates");
+    Engine engine(options_for(dir));
+    engine.open();
+    engine.execute("CREATE TABLE users (id INT PRIMARY KEY, grp INT)", nullptr);
+    engine.execute("CREATE TABLE events (id INT PRIMARY KEY, grp INT, "
+                   "label TEXT(8))",
+                   nullptr);
+    engine.execute("INSERT INTO users VALUES (1, 1), (2, 1), (3, 2)", nullptr);
+    engine.execute("INSERT INTO events VALUES (10, 1, 'a'), (11, 1, 'b'), "
+                   "(12, 2, 'c')",
+                   nullptr);
+
+    const auto rows = collect(engine,
+                              "SELECT users.id, events.id FROM users JOIN events "
+                              "ON users.grp = events.grp");
+    CHECK_EQ(rows.size(), 5u);
+    std::map<std::int64_t, int> per_user;
+    std::set<std::pair<std::int64_t, std::int64_t>> pairs;
+    for (const auto& row : rows) {
+        const std::int64_t user = row[0].as_int();
+        const std::int64_t event = row[1].as_int();
+        ++per_user[user];
+        pairs.insert({user, event});
+    }
+    CHECK_EQ(per_user[1], 2);
+    CHECK_EQ(per_user[2], 2);
+    CHECK_EQ(per_user[3], 1);
+    CHECK_EQ(pairs.size(), 5u);
+    CHECK(pairs.contains({1, 10}));
+    CHECK(pairs.contains({1, 11}));
+    CHECK(pairs.contains({2, 10}));
+    CHECK(pairs.contains({2, 11}));
+    CHECK(pairs.contains({3, 12}));
+
+    const auto counted =
+        collect(engine, "SELECT COUNT(*) FROM users JOIN events "
+                        "ON users.grp = events.grp");
+    CHECK_EQ(counted[0][0].as_int(), 5);
+    const auto filtered =
+        collect(engine, "SELECT COUNT(*) FROM users JOIN events "
+                        "ON users.grp = events.grp WHERE events.label != 'b'");
+    CHECK_EQ(filtered[0][0].as_int(), 3);
+    require_check(engine);
+}
+
+TEST(engine_join_homonymous) {
+    test::TempDir dir("engine-join-homonymous");
+    Engine engine(options_for(dir));
+    engine.open();
+    engine.execute("CREATE TABLE left_t (id INT PRIMARY KEY, v INT)", nullptr);
+    engine.execute("CREATE TABLE right_t (id INT PRIMARY KEY, v INT)", nullptr);
+    engine.execute("INSERT INTO left_t VALUES (1, 100), (2, 200)", nullptr);
+    engine.execute("INSERT INTO right_t VALUES (2, 20), (3, 30)", nullptr);
+
+    const auto rows =
+        collect(engine, "SELECT left_t.id, left_t.v, right_t.id, right_t.v "
+                        "FROM left_t JOIN right_t ON left_t.id = right_t.id");
+    CHECK_EQ(rows.size(), 1u);
+    CHECK_EQ(rows[0][0].as_int(), 2);
+    CHECK_EQ(rows[0][1].as_int(), 200);
+    CHECK_EQ(rows[0][2].as_int(), 2);
+    CHECK_EQ(rows[0][3].as_int(), 20);
+
+    const auto names = column_names(
+        engine, "SELECT * FROM left_t JOIN right_t ON left_t.id = right_t.id");
+    CHECK_EQ(names.size(), 4u);
+    CHECK_EQ(names[0], "left_t.id");
+    CHECK_EQ(names[1], "left_t.v");
+    CHECK_EQ(names[2], "right_t.id");
+    CHECK_EQ(names[3], "right_t.v");
+
+    const auto star = collect(
+        engine, "SELECT * FROM left_t JOIN right_t ON left_t.id = right_t.id");
+    CHECK_EQ(star.size(), 1u);
+    CHECK_EQ(star[0].size(), 4u);
+    CHECK_EQ(star[0][0].as_int(), 2);
+    CHECK_EQ(star[0][1].as_int(), 200);
+    CHECK_EQ(star[0][2].as_int(), 2);
+    CHECK_EQ(star[0][3].as_int(), 20);
+
+    const auto reversed = collect(
+        engine, "SELECT left_t.id, right_t.id FROM left_t JOIN right_t "
+                "ON right_t.id = left_t.id");
+    CHECK_EQ(reversed.size(), 1u);
+    CHECK_EQ(reversed[0][0].as_int(), 2);
+    CHECK_EQ(reversed[0][1].as_int(), 2);
+
+    CHECK_THROWS(engine.execute(
+        "SELECT id FROM left_t JOIN right_t ON left_t.id = right_t.id",
+        nullptr));
+    require_check(engine);
+}
+
+TEST(engine_join_memory_limit) {
+    test::TempDir dir("engine-join-memory");
+    EngineOptions options = options_for(dir);
+    options.join_buffer_bytes = 256;
+    Engine engine(options);
+    engine.open();
+    engine.execute("CREATE TABLE l (id INT PRIMARY KEY, v INT)", nullptr);
+    engine.execute("CREATE TABLE r (id INT PRIMARY KEY, v INT)", nullptr);
+    engine.execute("INSERT INTO l VALUES (1, 1)", nullptr);
+    engine.execute("BEGIN", nullptr);
+    for (int i = 0; i < 100; ++i) {
+        engine.execute("INSERT INTO r VALUES (" + std::to_string(i) + ", 0)",
+                       nullptr);
+    }
+    engine.execute("COMMIT", nullptr);
+
+    bool threw = false;
+    std::string message;
+    try {
+        (void)collect(engine, "SELECT l.id FROM l JOIN r ON l.id = r.id");
+    } catch (const db::Error& error) {
+        threw = true;
+        message = error.what();
+    }
+    CHECK(threw);
+    CHECK(message.find("hash join build side") != std::string::npos);
+    CHECK(message.find("memory limit") != std::string::npos);
+    require_check(engine);
+}
+
+TEST(engine_join_filter_order_limit) {
+    test::TempDir dir("engine-join-filter");
+    Engine engine(options_for(dir));
+    engine.open();
+    engine.execute("CREATE TABLE users (id INT PRIMARY KEY, grp INT)", nullptr);
+    engine.execute("CREATE TABLE events (id INT PRIMARY KEY, grp INT, "
+                   "label TEXT(8))",
+                   nullptr);
+    engine.execute("INSERT INTO users VALUES (1, 1), (2, 1), (3, 2)", nullptr);
+    engine.execute("INSERT INTO events VALUES (10, 1, 'a'), (11, 1, 'b'), "
+                   "(12, 2, 'c')",
+                   nullptr);
+
+    const auto rows =
+        collect(engine, "SELECT users.id, events.label FROM users JOIN events "
+                        "ON users.grp = events.grp WHERE events.label != 'b' "
+                        "ORDER BY users.id DESC LIMIT 2");
+    CHECK_EQ(rows.size(), 2u);
+    CHECK_EQ(rows[0][0].as_int(), 3);
+    CHECK_EQ(rows[0][1].text, "c");
+    CHECK_EQ(rows[1][0].as_int(), 2);
+    CHECK_EQ(rows[1][1].text, "a");
+    require_check(engine);
+}
+
+TEST(engine_join_text_key) {
+    test::TempDir dir("engine-join-text");
+    Engine engine(options_for(dir));
+    engine.open();
+    engine.execute("CREATE TABLE a (id INT PRIMARY KEY, city TEXT(8))", nullptr);
+    engine.execute("CREATE TABLE b (id INT PRIMARY KEY, city TEXT(8))", nullptr);
+    engine.execute("INSERT INTO a VALUES (1, 'x'), (2, 'y')", nullptr);
+    engine.execute("INSERT INTO b VALUES (10, 'y'), (11, 'y'), (12, 'z')",
+                   nullptr);
+
+    const auto rows = collect(engine,
+                              "SELECT a.id, b.id FROM a JOIN b "
+                              "ON a.city = b.city ORDER BY b.id");
+    CHECK_EQ(rows.size(), 2u);
+    CHECK_EQ(rows[0][0].as_int(), 2);
+    CHECK_EQ(rows[0][1].as_int(), 10);
+    CHECK_EQ(rows[1][0].as_int(), 2);
+    CHECK_EQ(rows[1][1].as_int(), 11);
     require_check(engine);
 }

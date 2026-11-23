@@ -46,6 +46,7 @@ struct Options {
     bool version = false;
     std::size_t buffer_pages = 4096;
     std::size_t sort_buffer_bytes = 4 * 1024 * 1024;
+    std::size_t join_buffer_bytes = 64 * 1024 * 1024;
     std::uint64_t bench_rows = 100000;
     std::uint64_t bench_queries = 1000;
 };
@@ -434,6 +435,7 @@ int run_benchmark(const Options& options) {
     engine_options.directory = directory;
     engine_options.buffer_pages = options.buffer_pages;
     engine_options.sort_buffer_bytes = options.sort_buffer_bytes;
+    engine_options.join_buffer_bytes = options.join_buffer_bytes;
 
     const std::uint64_t rows = options.bench_rows;
     const std::uint64_t queries = options.bench_queries;
@@ -626,6 +628,7 @@ void print_usage() {
            "  --queries N         benchmark queries (default: 1000)\n"
            "  --buffer-pages N    buffer pool size in 4 KB pages (default: 4096)\n"
            "  --sort-buffer BYTES sort buffer size before spilling (default: 4 MiB)\n"
+           "  --join-buffer BYTES hash join build-side limit (default: 64 MiB)\n"
            "  --help              show this help\n"
            "  --version           show the version\n";
 }
@@ -667,6 +670,9 @@ Options parse_args(int argc, char** argv) {
         } else if (arg == "--sort-buffer") {
             options.sort_buffer_bytes =
                 parse_size(value("--sort-buffer"), "--sort-buffer");
+        } else if (arg == "--join-buffer") {
+            options.join_buffer_bytes =
+                parse_size(value("--join-buffer"), "--join-buffer");
         } else if (arg == "--rows") {
             options.bench_rows = parse_size(value("--rows"), "--rows");
         } else if (arg == "--queries") {
@@ -703,6 +709,7 @@ int main(int argc, char** argv) {
         engine_options.directory = options.database;
         engine_options.buffer_pages = options.buffer_pages;
         engine_options.sort_buffer_bytes = options.sort_buffer_bytes;
+        engine_options.join_buffer_bytes = options.join_buffer_bytes;
         Engine engine(engine_options);
         engine.open();
 
