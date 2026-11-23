@@ -56,6 +56,27 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
 
+  recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Crash recovery (half-page write and killed processes)
+        run: ctest --test-dir build -R '^recovery$' --output-on-failure
+
   sanitizers:
     runs-on: ubuntu-latest
     steps:

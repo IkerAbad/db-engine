@@ -13,4 +13,9 @@ __pycache__/
 *.pyc
 data/
 bench-data/
+dist/
+stage/
+*.zip
+*.tar.gz
+*.sha256
 CMakeUserPresets.json

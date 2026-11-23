@@ -108,7 +108,8 @@ them at deterministic points and reopens the database. It also kills a process
 at a random moment five times.
 
 The same build is exercised on Linux with GCC and AddressSanitizer/UBSan, and
-on Windows with MSVC.
+on Windows with MSVC. A separate recovery job runs only the crash suite, so the
+process-kill tests cannot silently disappear from the main test run.
 
 ## Architecture
 
@@ -219,19 +220,26 @@ Measured on 2026-11-23 with the Release build produced by GCC 14.2.0 (MSYS2
 UCRT64) on Windows 11, an AMD Ryzen 9 5900X, 32 GB of DDR4-3600 memory and an
 NTFS volume:
 
+| Metric | Result |
+|---|---|
+| Inserts per second (100,000 rows, one transaction) | 14,455 |
+| Range queries per second (1,000 queries, 100 rows each) | 30,566 |
+| Point lookups per second | 368,718 |
+| Peak resident memory | 25.20 MiB |
+
 ```bash
 ./build/db_engine --bench --rows 100000 --queries 1000 --buffer-pages 4096
 ```
 
 ```
 operation                      ops      p50 ms      p99 ms     mean ms         ops/s
-insert (one txn)            100000      0.0069      2.5255      0.0677         14625
-insert (autocommit)            200      2.5970      8.1528      2.7342           366
-range scan (100 rows)         1000      0.0284      0.0539      0.0316         31608
-point lookup                  1000      0.0039      0.0094      0.0038        266049
-count(*)                         1     26.8392     26.8392     26.8392            37
+insert (one txn)            100000      0.0071      2.5367      0.0685         14455
+insert (autocommit)            200      2.3781      7.1904      2.5960           385
+range scan (100 rows)         1000      0.0285      0.0551      0.0327         30566
+point lookup                  1000      0.0025      0.0049      0.0027        368718
+count(*)                         1     25.5899     25.5899     25.5899            39
 
-commit (batch)          2.62 ms
+commit (batch)          2.30 ms
 peak RSS                25.20 MB
 data file               8.77 MB (2246 pages)
 wal file                19.63 MB
@@ -250,6 +258,24 @@ Memory is bounded by construction: a 4096-frame buffer pool (16 MiB), a 4 MiB
 sort buffer and one row per iterator. The 25 MiB peak is the pool plus the
 process itself. With `--buffer-pages 256` the 10,000-row run peaks at 7.73 MiB,
 at the cost of more page writes and a lower insert throughput.
+
+## Why not SQLite
+
+This project demonstrates the machinery that a relational database needs and
+that a high-level API hides: a 4 KB slotted page format, an LRU buffer pool, a
+B+tree that splits and merges, a write-ahead log that orders page images and row
+records, checkpoints, and a recovery path tested by killing the process at
+every step of the commit and page-write sequence. The benchmark and the crash
+suite are part of the deliverable because they turn those mechanisms into
+something measurable and falsifiable rather than a diagram in a README.
+
+It does not compete with SQLite, and it is not a replacement for any production
+database. SQLite has decades of hardening, a query planner, secondary indexes,
+joins, concurrent readers, a huge compatibility and test surface, and an
+ecosystem around it. This engine is single-threaded, has one active transaction,
+no joins or secondary indexes, never reuses pages, and rebuilds its B+tree
+during recovery. Its purpose is to show that the mechanisms can be built and
+verified from scratch, not to store anyone's real data.
 
 ## What is deliberately missing
 
