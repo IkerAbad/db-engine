@@ -215,8 +215,9 @@ is visible.
 
 ## Benchmark
 
-Measured on 2026-11-23 with the Release build on Windows 11, an AMD Ryzen 9
-5900X, 32 GB of DDR4-3600 memory and an NTFS volume:
+Measured on 2026-11-23 with the Release build produced by GCC 14.2.0 (MSYS2
+UCRT64) on Windows 11, an AMD Ryzen 9 5900X, 32 GB of DDR4-3600 memory and an
+NTFS volume:
 
 ```bash
 ./build/db_engine --bench --rows 100000 --queries 1000 --buffer-pages 4096
